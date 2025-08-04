@@ -1,3 +1,4 @@
+
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
@@ -30,7 +31,6 @@
 #include "thread.h"
 
 namespace Stockfish {
-
 
 // TTEntry struct is the 10 bytes transposition table entry, defined as below:
 //
@@ -114,7 +114,6 @@ void TTEntry::save(
         depth8--;
 }
 
-
 uint8_t TTEntry::relative_age(const uint8_t generation8) const {
     // Due to our packed storage format for generation and its cyclic
     // nature we add GENERATION_CYCLE (256 is the modulus, plus what
@@ -124,7 +123,6 @@ uint8_t TTEntry::relative_age(const uint8_t generation8) const {
     return (GENERATION_CYCLE + generation8 - genBound8) & GENERATION_MASK;
 }
 
-
 // TTWriter is but a very thin wrapper around the pointer
 TTWriter::TTWriter(TTEntry* tte) :
     entry(tte) {}
@@ -133,7 +131,6 @@ void TTWriter::write(
   Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev, uint8_t generation8) {
     entry->save(k, v, pv, b, d, m, ev, generation8);
 }
-
 
 // A TranspositionTable is an array of Cluster, of size clusterCount. Each cluster consists of ClusterSize number
 // of TTEntry. Each non-empty TTEntry contains information on exactly one position. The size of a Cluster should
@@ -148,26 +145,30 @@ struct Cluster {
 
 static_assert(sizeof(Cluster) == 32, "Suboptimal Cluster size");
 
-
 // Sets the size of the transposition table,
 // measured in megabytes. Transposition table consists
 // of clusters and each cluster consists of ClusterSize number of TTEntry.
-void TranspositionTable::resize(size_t mbSize, ThreadPool& threads) {
+#ifdef USE_NUMA_TT
+void TranspositionTable::resize(size_t mbSize, NumaNodeID node) {
+#else
+void TranspositionTable::resize(size_t mbSize) {
+#endif
     aligned_large_pages_free(table);
 
     clusterCount = mbSize * 1024 * 1024 / sizeof(Cluster);
 
+#ifdef USE_NUMA_TT
+    table = static_cast<Cluster*>(aligned_large_pages_alloc(clusterCount * sizeof(Cluster), node));
+#else
     table = static_cast<Cluster*>(aligned_large_pages_alloc(clusterCount * sizeof(Cluster)));
+#endif
 
     if (!table)
     {
         std::cerr << "Failed to allocate " << mbSize << "MB for transposition table." << std::endl;
         exit(EXIT_FAILURE);
     }
-
-    clear(threads);
 }
-
 
 // Initializes the entire transposition table to zero,
 // in a multi-threaded way.
@@ -191,7 +192,6 @@ void TranspositionTable::clear(ThreadPool& threads) {
         threads.wait_on_thread(i);
 }
 
-
 // Returns an approximation of the hashtable
 // occupation during a search. The hash is x permill full, as per UCI protocol.
 // Only counts entries which match the current generation.
@@ -206,15 +206,12 @@ int TranspositionTable::hashfull(int maxAge) const {
     return cnt / ClusterSize;
 }
 
-
 void TranspositionTable::new_search() {
     // increment by delta to keep lower bits as is
     generation8 += GENERATION_DELTA;
 }
 
-
 uint8_t TranspositionTable::generation() const { return generation8; }
-
 
 // Looks up the current position in the transposition
 // table. It returns true if the position is found.
@@ -222,7 +219,7 @@ uint8_t TranspositionTable::generation() const { return generation8; }
 // to be replaced later. The replace value of an entry is calculated as its depth
 // minus 8 times its relative age. TTEntry t1 is considered more valuable than
 // TTEntry t2 if its replace value is greater than that of t2.
-std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key) const {
+ProbeResult TranspositionTable::probe(const Key key) const {
 
     TTEntry* const tte   = first_entry(key);
     const uint16_t key16 = uint16_t(key);  // Use the low 16 bits as key inside the cluster
@@ -231,7 +228,7 @@ std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key) cons
         if (tte[i].key16 == key16)
             // This gap is the main place for read races.
             // After `read()` completes that copy is final, but may be self-inconsistent.
-            return {tte[i].is_occupied(), tte[i].read(), TTWriter(&tte[i])};
+            return {tte[i].is_occupied(), tte[i].read(), TTWriter(&tte[i]), {}};
 
     // Find an entry to be replaced according to the replacement strategy
     TTEntry* replace = tte;
@@ -240,11 +237,13 @@ std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key) cons
             > tte[i].depth8 - tte[i].relative_age(generation8))
             replace = &tte[i];
 
+    // Before returning, read the victim's data so the caller can use it.
+    TTData victimData = replace->read();
+
     return {false,
             TTData{Move::none(), VALUE_NONE, VALUE_NONE, DEPTH_ENTRY_OFFSET, BOUND_NONE, false},
-            TTWriter(replace)};
+            TTWriter(replace), victimData};
 }
-
 
 TTEntry* TranspositionTable::first_entry(const Key key) const {
     return &table[mul_hi64(key, clusterCount)].entry[0];
