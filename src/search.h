@@ -38,6 +38,7 @@
 #include "numa.h"
 #include "position.h"
 #include "score.h"
+#include "searchpolicies.h" // New header for modular search heuristics
 #include "syzygy/tbprobe.h"
 #include "timeman.h"
 #include "types.h"
@@ -61,8 +62,8 @@ namespace Search {
 // shallower and deeper in the tree during the search. Each search thread has
 // its own array of Stack objects, indexed by the current ply.
 struct Stack {
-    Move*                       pv;
-    PieceToHistory*             continuationHistory;
+    Move* pv;
+    PieceToHistory* continuationHistory;
     CorrectionHistory<PieceTo>* continuationCorrectionHistory;
     int                         ply;
     Move                        currentMove;
@@ -79,9 +80,7 @@ struct Stack {
 };
 
 
-// RootMove struct is used for moves at the root of the tree. For each root move
-// we store a score and a PV (really a refutation in the case of moves which
-// fail low). Score is normally set at -VALUE_INFINITE for all non-pv moves.
+// RootMove struct is used for moves at the root of the tree.
 struct RootMove {
 
     explicit RootMove(Move m) :
@@ -93,17 +92,17 @@ struct RootMove {
         return m.score != score ? m.score < score : m.previousScore < previousScore;
     }
 
-    uint64_t          effort           = 0;
-    Value             score            = -VALUE_INFINITE;
-    Value             previousScore    = -VALUE_INFINITE;
-    Value             averageScore     = -VALUE_INFINITE;
-    Value             meanSquaredScore = -VALUE_INFINITE * VALUE_INFINITE;
-    Value             uciScore         = -VALUE_INFINITE;
-    bool              scoreLowerbound  = false;
-    bool              scoreUpperbound  = false;
-    int               selDepth         = 0;
-    int               tbRank           = 0;
-    Value             tbScore;
+    uint64_t            effort           = 0;
+    Value               score            = -VALUE_INFINITE;
+    Value               previousScore    = -VALUE_INFINITE;
+    Value               averageScore     = -VALUE_INFINITE;
+    Value               meanSquaredScore = -VALUE_INFINITE * VALUE_INFINITE;
+    Value               uciScore         = -VALUE_INFINITE;
+    bool                scoreLowerbound  = false;
+    bool                scoreUpperbound  = false;
+    int                 selDepth         = 0;
+    int                 tbRank           = 0;
+    Value               tbScore;
     std::vector<Move> pv;
 };
 
@@ -112,7 +111,6 @@ using RootMoves = std::vector<RootMove>;
 
 // LimitsType struct stores information sent by the caller about the analysis required.
 struct LimitsType {
-
     // Init explicitly due to broken value-initialization of non POD in MSVC
     LimitsType() {
         time[WHITE] = time[BLACK] = inc[WHITE] = inc[BLACK] = npmsec = movetime = TimePoint(0);
@@ -131,28 +129,45 @@ struct LimitsType {
 };
 
 
-// The UCI stores the uci options, thread pool, and transposition table.
-// This struct is used to easily forward data to the Search::Worker class.
+// The SharedState struct is used to easily forward shared data to the Search::Worker class.
+// Its layout is conditionally compiled to support both UMA and NUMA architectures.
 struct SharedState {
-    SharedState(const OptionsMap&                               optionsMap,
+    SharedState(const OptionsMap&                                 optionsMap,
                 ThreadPool&                                     threadPool,
+#ifndef USE_NUMA_TT
                 TranspositionTable&                             transpositionTable,
+#endif
                 const LazyNumaReplicated<Eval::NNUE::Networks>& nets) :
         options(optionsMap),
         threads(threadPool),
+#ifdef USE_NUMA_TT
+        networks(nets),
+        generation8(0)
+#else
         tt(transpositionTable),
-        networks(nets) {}
+        networks(nets)
+#endif
+    {}
 
-    const OptionsMap&                               options;
-    ThreadPool&                                     threads;
-    TranspositionTable&                             tt;
+    const OptionsMap&                                 options;
+    ThreadPool&                                       threads;
     const LazyNumaReplicated<Eval::NNUE::Networks>& networks;
+
+#ifdef USE_NUMA_TT
+    // The new TT hierarchy for NUMA systems
+    std::vector<std::unique_ptr<TranspositionTable>> l1_tts;
+    std::unique_ptr<TranspositionTable>              l2_tt;
+    // The generation counter is now shared at this level for all TTs
+    std::atomic<uint8_t>                             generation8;
+#else
+    // The original single TT for UMA systems
+    TranspositionTable& tt;
+#endif
 };
 
 class Worker;
 
 // Null Object Pattern, implement a common interface for the SearchManagers.
-// A Null Object will be given to non-mainthread workers.
 class ISearchManager {
    public:
     virtual ~ISearchManager() {}
@@ -183,12 +198,7 @@ struct InfoIteration {
     size_t           currmovenumber;
 };
 
-// Skill structure is used to implement strength limit. If we have a UCI_Elo,
-// we convert it to an appropriate skill level, anchored to the Stash engine.
-// This method is based on a fit of the Elo results for games played between
-// Stockfish at various skill levels and various versions of the Stash engine.
-// Skill 0 .. 19 now covers CCRL Blitz Elo from 1320 to 3190, approximately
-// Reference: https://github.com/vondele/Stockfish/commit/a08b8d4e9711c2
+// Skill structure is used to implement strength limit.
 struct Skill {
     // Lowest and highest Elo ratings used in the skill level calculation
     constexpr static int LowestElo  = 1320;
@@ -211,8 +221,7 @@ struct Skill {
     Move   best = Move::none();
 };
 
-// SearchManager manages the search from the main thread. It is responsible for
-// keeping track of the time, and storing data strictly related to the main thread.
+// SearchManager manages the search from the main thread.
 class SearchManager: public ISearchManager {
    public:
     using UpdateShort    = std::function<void(const InfoShort&)>;
@@ -227,7 +236,6 @@ class SearchManager: public ISearchManager {
         UpdateBestmove onBestmove;
     };
 
-
     SearchManager(const UpdateContext& updateContext) :
         updates(updateContext) {}
 
@@ -235,22 +243,21 @@ class SearchManager: public ISearchManager {
 
     void pv(Search::Worker&           worker,
             const ThreadPool&         threads,
+#ifndef USE_NUMA_TT
             const TranspositionTable& tt,
+#endif
             Depth                     depth);
 
     Stockfish::TimeManagement tm;
     double                    originalTimeAdjust;
     int                       callsCnt;
     std::atomic_bool          ponder;
-
     std::array<Value, 4> iterValue;
     double               previousTimeReduction;
     Value                bestPreviousScore;
     Value                bestPreviousAverageScore;
     bool                 stopOnPonderhit;
-
     size_t id;
-
     const UpdateContext& updates;
 };
 
@@ -261,60 +268,52 @@ class NullSearchManager: public ISearchManager {
 
 
 // Search::Worker is the class that does the actual search.
-// It is instantiated once per thread, and it is responsible for keeping track
-// of the search history, and storing data required for the search.
 class Worker {
    public:
     Worker(SharedState&, std::unique_ptr<ISearchManager>, size_t, NumaReplicatedAccessToken);
 
-    // Called at instantiation to initialize reductions tables.
-    // Reset histories, usually before a new game.
     void clear();
-
-    // Called when the program receives the UCI 'go' command.
-    // It searches from the root position and outputs the "bestmove".
     void start_searching();
-
     bool is_mainthread() const { return threadIdx == 0; }
-
     void ensure_network_replicated();
 
-    // Public because they need to be updatable by the stats
+    // Public move ordering and history tables
     ButterflyHistory mainHistory;
     LowPlyHistory    lowPlyHistory;
-
     CapturePieceToHistory captureHistory;
     ContinuationHistory   continuationHistory[2][2];
     PawnHistory           pawnHistory;
-
     CorrectionHistory<Pawn>         pawnCorrectionHistory;
     CorrectionHistory<Minor>        minorPieceCorrectionHistory;
     CorrectionHistory<NonPawn>      nonPawnCorrectionHistory;
     CorrectionHistory<Continuation> continuationCorrectionHistory;
-
     TTMoveHistory ttMoveHistory;
 
    private:
     void iterative_deepening();
-
     void do_move(Position& pos, const Move move, StateInfo& st, Stack* const ss);
-    void
-    do_move(Position& pos, const Move move, StateInfo& st, const bool givesCheck, Stack* const ss);
+    void do_move(Position& pos, const Move move, StateInfo& st, const bool givesCheck, Stack* const ss);
     void do_null_move(Position& pos, StateInfo& st);
     void undo_move(Position& pos, const Move move);
     void undo_null_move(Position& pos);
 
-    // This is the main search function, for both PV and non-PV nodes
-    template<NodeType nodeType>
+    // The main search function, now templated on node type and search policies
+    template<NodeType NT,
+             typename RazoringPolicy,
+             typename FutilityPolicy,
+             typename NMPolicy,
+             typename LMRPolicy,
+             typename SEEPolicy,
+             typename ExtensionPolicy>
     Value search(Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode);
 
-    // Quiescence search function, which is called by the main search
-    template<NodeType nodeType>
+    // Quiescence search function, now templated on its policies
+    template<NodeType NT,
+             typename SEEPolicy>
     Value qsearch(Position& pos, Stack* ss, Value alpha, Value beta);
 
     Depth reduction(bool i, Depth d, int mn, int delta) const;
 
-    // Pointer to the search manager, only allowed to be called by the main thread
     SearchManager* main_manager() const {
         assert(threadIdx == 0);
         return static_cast<SearchManager*>(manager.get());
@@ -322,40 +321,39 @@ class Worker {
 
     TimePoint elapsed() const;
     TimePoint elapsed_time() const;
-
     Value evaluate(const Position&);
 
+    // Member Variables
     LimitsType limits;
-
     size_t                pvIdx, pvLast;
     std::atomic<uint64_t> nodes, tbHits, bestMoveChanges;
     int                   selDepth, nmpMinPly;
-
     Value optimism[COLOR_NB];
-
     Position  rootPos;
     StateInfo rootState;
     RootMoves rootMoves;
     Depth     rootDepth, completedDepth;
     Value     rootDelta;
-
     size_t                    threadIdx;
     NumaReplicatedAccessToken numaAccessToken;
-
-    // Reductions lookup table initialized at startup
-    std::array<int, MAX_MOVES> reductions;  // [depth or moveNumber]
-
-    // The main thread has a SearchManager, the others have a NullSearchManager
+    std::array<int, MAX_MOVES> reductions;
     std::unique_ptr<ISearchManager> manager;
-
     Tablebases::Config tbConfig;
-
-    const OptionsMap&                               options;
-    ThreadPool&                                     threads;
-    TranspositionTable&                             tt;
+    const OptionsMap&                                 options;
+    ThreadPool&                                       threads;
     const LazyNumaReplicated<Eval::NNUE::Networks>& networks;
 
-    // Used by NNUE
+#ifdef USE_NUMA_TT
+    // Pointers to this worker's assigned TTs for NUMA builds
+    TranspositionTable* l1_tt;
+    TranspositionTable* l2_tt;
+    // Reference to the shared generation counter
+    std::atomic<uint8_t>& generation8;
+#else
+    // Original single TT reference for standard UMA builds
+    TranspositionTable& tt;
+#endif
+
     Eval::NNUE::AccumulatorStack  accumulatorStack;
     Eval::NNUE::AccumulatorCaches refreshTable;
 
@@ -368,9 +366,7 @@ struct ConthistBonus {
     int weight;
 };
 
-
 }  // namespace Search
-
 }  // namespace Stockfish
 
 #endif  // #ifndef SEARCH_H_INCLUDED
