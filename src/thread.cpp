@@ -60,7 +60,6 @@ Thread::Thread(Search::SharedState&                    sharedState,
     wait_for_search_finished();
 }
 
-
 // Destructor wakes up the thread in idle_loop() and waits
 // for its termination. Thread should be already waiting.
 Thread::~Thread() {
@@ -153,6 +152,14 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
 
     if (requested > 0)  // create new thread(s)
     {
+#ifdef USE_NUMA_TT
+        // Clear out any old TTs before creating new ones. Important for UCI 'setoption'
+        // which calls ThreadPool::set.
+        sharedState.l1_tts.clear();
+        sharedState.l2_tt.reset();
+        sharedState.generation8 = 0;
+#endif
+
         // Binding threads may be problematic when there's multiple NUMA nodes and
         // multiple Stockfish instances running. In particular, if each instance
         // runs a single thread then they would all be mapped to the first NUMA node.
@@ -175,6 +182,27 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
                                 ? numaConfig.distribute_threads_among_numa_nodes(requested)
                                 : std::vector<NumaIndex>{};
 
+#ifdef USE_NUMA_TT
+        size_t l1_size = size_t(sharedState.options["HashL1PerNodeMB"]);
+        size_t l2_size = size_t(sharedState.options["HashL2SharedMB"]);
+
+        // Create the L1 Tables, one per NUMA node that has threads assigned to it
+        sharedState.l1_tts.resize(numaConfig.numa_node_count());
+        for (NumaNodeID i = 0; i < numaConfig.numa_node_count(); ++i) {
+            // Only allocate if at least one thread is bound to this node
+            bool node_is_used = doBindThreads && std::any_of(boundThreadToNumaNode.begin(), boundThreadToNumaNode.end(),
+                                            [i](auto id){ return id == i; });
+            if (node_is_used) {
+                auto l1_tt = std::make_unique<TranspositionTable>();
+                l1_tt->resize(l1_size, i); // Allocate on the specific node
+                sharedState.l1_tts[i] = std::move(l1_tt);
+            }
+        }
+        // Create the shared L2 Table, always on node 0
+        sharedState.l2_tt = std::make_unique<TranspositionTable>();
+        sharedState.l2_tt->resize(l2_size, 0);
+#endif
+
         while (threads.size() < requested)
         {
             const size_t    threadId = threads.size();
@@ -194,17 +222,29 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
               std::make_unique<Thread>(sharedState, std::move(manager), threadId, binder));
         }
 
-        clear();
+        // With threads created, we can now clear the TTs in parallel
+        // and assign the correct TT pointers to each worker.
+        if (requested > 0)
+        {
+            clear();
+        }
 
         main_thread()->wait_for_search_finished();
     }
 }
 
-
 // Sets threadPool data to initial values
 void ThreadPool::clear() {
     if (threads.size() == 0)
         return;
+
+#ifdef USE_NUMA_TT
+    // Clear all tables in the hierarchy in parallel
+    for(auto& tt : sharedState.l1_tts) if (tt) tt->clear(*this);
+    if (sharedState.l2_tt) sharedState.l2_tt->clear(*this);
+#else
+    sharedState.tt.clear(*this);
+#endif
 
     for (auto&& th : threads)
         th->clear_worker();
@@ -233,7 +273,6 @@ void ThreadPool::wait_on_thread(size_t threadId) {
 }
 
 size_t ThreadPool::num_threads() const { return threads.size(); }
-
 
 // Wakes up main thread waiting in idle_loop() and returns immediately.
 // Main thread will wake up other threads and start the search.
@@ -364,7 +403,6 @@ Thread* ThreadPool::get_best_thread() const {
     return bestThread;
 }
 
-
 // Start non-main threads.
 // Will be invoked by main thread after it has started searching.
 void ThreadPool::start_searching() {
@@ -373,7 +411,6 @@ void ThreadPool::start_searching() {
         if (th != threads.front())
             th->start_searching();
 }
-
 
 // Wait for non-main threads
 void ThreadPool::wait_for_search_finished() const {
