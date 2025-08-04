@@ -26,6 +26,11 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
     #include <sys/mman.h>
+#ifdef USE_NUMA_TT
+    // requires libnuma-dev package
+    #include <numa.h>
+    #include <numaif.h>
+#endif
 #endif
 
 #if defined(__APPLE__) || defined(__ANDROID__) || defined(__OpenBSD__) \
@@ -60,9 +65,12 @@ using OpenProcessToken_t      = bool (*)(HANDLE, DWORD, PHANDLE);
 using LookupPrivilegeValueA_t = bool (*)(LPCSTR, LPCSTR, PLUID);
 using AdjustTokenPrivileges_t =
   bool (*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+
+#ifdef USE_NUMA_TT
+using VirtualAllocExNuma_t = LPVOID (*)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD, DWORD);
+#endif
 }
 #endif
-
 
 namespace Stockfish {
 
@@ -87,7 +95,6 @@ void* std_aligned_alloc(size_t alignment, size_t size) {
 }
 
 void std_aligned_free(void* ptr) {
-
 #if defined(POSIXALIGNEDALLOC)
     free(ptr);
 #elif defined(_WIN32) && !defined(_M_ARM) && !defined(_M_ARM64)
@@ -104,7 +111,11 @@ void std_aligned_free(void* ptr) {
 
 #if defined(_WIN32)
 
+#ifdef USE_NUMA_TT
+static void* aligned_large_pages_alloc_windows(size_t allocSize, NumaNodeID node) {
+#else
 static void* aligned_large_pages_alloc_windows([[maybe_unused]] size_t allocSize) {
+#endif
 
     #if !defined(_WIN64)
     return nullptr;
@@ -138,6 +149,12 @@ static void* aligned_large_pages_alloc_windows([[maybe_unused]] size_t allocSize
     if (!AdjustTokenPrivileges_f)
         return nullptr;
 
+#ifdef USE_NUMA_TT
+    // For NUMA, we need VirtualAllocExNuma, dynamically loaded for compatibility
+    auto VirtualAllocExNuma_f = VirtualAllocExNuma_t((void (*)()) GetProcAddress(
+        GetModuleHandle(TEXT("kernel32.dll")), "VirtualAllocExNuma"));
+#endif
+
     // We need SeLockMemoryPrivilege, so try to enable it for the process
 
     if (!OpenProcessToken_f(  // OpenProcessToken()
@@ -164,8 +181,17 @@ static void* aligned_large_pages_alloc_windows([[maybe_unused]] size_t allocSize
         {
             // Round up size to full pages and allocate
             allocSize = (allocSize + largePageSize - 1) & ~size_t(largePageSize - 1);
-            mem       = VirtualAlloc(nullptr, allocSize, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-                                     PAGE_READWRITE);
+#ifdef USE_NUMA_TT
+            if (VirtualAllocExNuma_f && node != NumaNodeIDAll)
+            {
+                mem = VirtualAllocExNuma_f(GetCurrentProcess(), nullptr, allocSize,
+                                           MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                           PAGE_READWRITE, node);
+            }
+            else
+#endif
+            mem = VirtualAlloc(nullptr, allocSize, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                               PAGE_READWRITE);
 
             // Privilege no longer needed, restore previous state
             AdjustTokenPrivileges_f(hProcessToken, FALSE, &prevTp, 0, nullptr, nullptr);
@@ -179,10 +205,18 @@ static void* aligned_large_pages_alloc_windows([[maybe_unused]] size_t allocSize
     #endif
 }
 
+#ifdef USE_NUMA_TT
+void* aligned_large_pages_alloc(size_t allocSize, NumaNodeID node) {
+#else
 void* aligned_large_pages_alloc(size_t allocSize) {
+#endif
 
     // Try to allocate large pages
+#ifdef USE_NUMA_TT
+    void* mem = aligned_large_pages_alloc_windows(allocSize, node);
+#else
     void* mem = aligned_large_pages_alloc_windows(allocSize);
+#endif
 
     // Fall back to regular, page-aligned, allocation if necessary
     if (!mem)
@@ -193,7 +227,11 @@ void* aligned_large_pages_alloc(size_t allocSize) {
 
 #else
 
+#ifdef USE_NUMA_TT
+void* aligned_large_pages_alloc(size_t allocSize, NumaNodeID node) {
+#else
 void* aligned_large_pages_alloc(size_t allocSize) {
+#endif
 
     #if defined(__linux__)
     constexpr size_t alignment = 2 * 1024 * 1024;  // 2MB page size assumed
@@ -207,6 +245,16 @@ void* aligned_large_pages_alloc(size_t allocSize) {
     #if defined(MADV_HUGEPAGE)
     madvise(mem, size, MADV_HUGEPAGE);
     #endif
+
+    #ifdef USE_NUMA_TT
+    if (mem && numa_available() != -1 && node != NumaNodeIDAll)
+    {
+        unsigned long nodemask = 1UL << node;
+        // Bind the memory region to the specified NUMA node after allocation
+        mbind(mem, size, MPOL_BIND, &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
+    }
+    #endif
+
     return mem;
 }
 
@@ -217,7 +265,11 @@ bool has_large_pages() {
 #if defined(_WIN32)
 
     constexpr size_t page_size = 2 * 1024 * 1024;  // 2MB page size assumed
-    void*            mem       = aligned_large_pages_alloc_windows(page_size);
+#ifdef USE_NUMA_TT
+    void* mem = aligned_large_pages_alloc_windows(page_size, NumaNodeIDAll);
+#else
+    void* mem = aligned_large_pages_alloc_windows(page_size);
+#endif
     if (mem == nullptr)
     {
         return false;
@@ -243,7 +295,6 @@ bool has_large_pages() {
 #endif
 }
 
-
 // aligned_large_pages_free() will free the previously memory allocated
 // by aligned_large_pages_alloc(). The effect is a nop if mem == nullptr.
 
@@ -265,4 +316,5 @@ void aligned_large_pages_free(void* mem) {
 void aligned_large_pages_free(void* mem) { std_aligned_free(mem); }
 
 #endif
+
 }  // namespace Stockfish
