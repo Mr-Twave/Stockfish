@@ -30,6 +30,7 @@
 #include "search.h"
 #include "syzygy/tbprobe.h"
 #include "timeman.h"
+#include "tt.h"
 #include "types.h"
 #include "uci.h"
 #include "ucioption.h"
@@ -60,6 +61,7 @@ Thread::Thread(Search::SharedState&                    sharedState,
     wait_for_search_finished();
 }
 
+
 // Destructor wakes up the thread in idle_loop() and waits
 // for its termination. Thread should be already waiting.
 Thread::~Thread() {
@@ -71,11 +73,13 @@ Thread::~Thread() {
     stdThread.join();
 }
 
+
 // Wakes up the thread that will start the search
 void Thread::start_searching() {
     assert(worker != nullptr);
     run_custom_job([this]() { worker->start_searching(); });
 }
+
 
 // Clears the histories for the thread worker (usually before a new game)
 void Thread::clear_worker() {
@@ -83,12 +87,13 @@ void Thread::clear_worker() {
     run_custom_job([this]() { worker->clear(); });
 }
 
+
 // Blocks on the condition variable until the thread has finished searching
 void Thread::wait_for_search_finished() {
-
     std::unique_lock<std::mutex> lk(mutex);
     cv.wait(lk, [&] { return !searching; });
 }
+
 
 // Launching a function in the thread
 void Thread::run_custom_job(std::function<void()> f) {
@@ -103,9 +108,9 @@ void Thread::run_custom_job(std::function<void()> f) {
 
 void Thread::ensure_network_replicated() { worker->ensure_network_replicated(); }
 
+
 // Thread gets parked here, blocked on the condition variable
 // when the thread has no work to do.
-
 void Thread::idle_loop() {
     while (true)
     {
@@ -127,24 +132,30 @@ void Thread::idle_loop() {
     }
 }
 
+
+ThreadPool::ThreadPool(Search::SharedState& ss) :
+#ifdef USE_NUMA_TT
+    generation8(ss.generation8),
+#endif
+    sharedState(ss) {}
+
+
 Search::SearchManager* ThreadPool::main_manager() { return main_thread()->worker->main_manager(); }
 
 uint64_t ThreadPool::nodes_searched() const { return accumulate(&Search::Worker::nodes); }
 uint64_t ThreadPool::tb_hits() const { return accumulate(&Search::Worker::tbHits); }
 
+
 // Creates/destroys threads to match the requested number.
 // Created and launched threads will immediately go to sleep in idle_loop.
 // Upon resizing, threads are recreated to allow for binding if necessary.
 void ThreadPool::set(const NumaConfig&                           numaConfig,
-                     Search::SharedState                         sharedState,
                      const Search::SearchManager::UpdateContext& updateContext) {
 
     if (threads.size() > 0)  // destroy any existing thread(s)
     {
         main_thread()->wait_for_search_finished();
-
         threads.clear();
-
         boundThreadToNumaNode.clear();
     }
 
@@ -153,19 +164,13 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
     if (requested > 0)  // create new thread(s)
     {
 #ifdef USE_NUMA_TT
-        // Clear out any old TTs before creating new ones. Important for UCI 'setoption'
-        // which calls ThreadPool::set.
+        // Clear out any old TTs before creating new ones. Important for UCI 'setoption'.
         sharedState.l1_tts.clear();
         sharedState.l2_tt.reset();
         sharedState.generation8 = 0;
 #endif
-
         // Binding threads may be problematic when there's multiple NUMA nodes and
-        // multiple Stockfish instances running. In particular, if each instance
-        // runs a single thread then they would all be mapped to the first NUMA node.
-        // This is undesirable, and so the default behaviour (i.e. when the user does not
-        // change the NumaConfig UCI setting) is to not bind the threads to processors
-        // unless we know for sure that we span NUMA nodes and replication is required.
+        // multiple Stockfish instances running...
         const std::string numaPolicy(sharedState.options["NumaPolicy"]);
         const bool        doBindThreads = [&]() {
             if (numaPolicy == "none")
@@ -179,9 +184,8 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
         }();
 
         boundThreadToNumaNode = doBindThreads
-                                ? numaConfig.distribute_threads_among_numa_nodes(requested)
-                                : std::vector<NumaIndex>{};
-
+                                  ? numaConfig.distribute_threads_among_numa_nodes(requested)
+                                  : std::vector<NumaIndex>{};
 #ifdef USE_NUMA_TT
         size_t l1_size = size_t(sharedState.options["HashL1PerNodeMB"]);
         size_t l2_size = size_t(sharedState.options["HashL2SharedMB"]);
@@ -189,18 +193,20 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
         // Create the L1 Tables, one per NUMA node that has threads assigned to it
         sharedState.l1_tts.resize(numaConfig.numa_node_count());
         for (NumaNodeID i = 0; i < numaConfig.numa_node_count(); ++i) {
-            // Only allocate if at least one thread is bound to this node
-            bool node_is_used = doBindThreads && std::any_of(boundThreadToNumaNode.begin(), boundThreadToNumaNode.end(),
+            bool node_is_used = !doBindThreads ? (i == 0) :
+                                std::any_of(boundThreadToNumaNode.begin(), boundThreadToNumaNode.end(),
                                             [i](auto id){ return id == i; });
-            if (node_is_used) {
+            if (node_is_used && l1_size > 0) {
                 auto l1_tt = std::make_unique<TranspositionTable>();
-                l1_tt->resize(l1_size, i); // Allocate on the specific node
+                l1_tt->resize(l1_size, i);
                 sharedState.l1_tts[i] = std::move(l1_tt);
             }
         }
         // Create the shared L2 Table, always on node 0
-        sharedState.l2_tt = std::make_unique<TranspositionTable>();
-        sharedState.l2_tt->resize(l2_size, 0);
+        if (l2_size > 0) {
+            sharedState.l2_tt = std::make_unique<TranspositionTable>();
+            sharedState.l2_tt->resize(l2_size, 0);
+        }
 #endif
 
         while (threads.size() < requested)
@@ -208,22 +214,17 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
             const size_t    threadId = threads.size();
             const NumaIndex numaId   = doBindThreads ? boundThreadToNumaNode[threadId] : 0;
             auto            manager  = threadId == 0 ? std::unique_ptr<Search::ISearchManager>(
-                                             std::make_unique<Search::SearchManager>(updateContext))
-                                                     : std::make_unique<Search::NullSearchManager>();
+                                          std::make_unique<Search::SearchManager>(updateContext))
+                                      : std::make_unique<Search::NullSearchManager>();
 
-            // When not binding threads we want to force all access to happen
-            // from the same NUMA node, because in case of NUMA replicated memory
-            // accesses we don't want to trash cache in case the threads get scheduled
-            // on the same NUMA node.
             auto binder = doBindThreads ? OptionalThreadToNumaNodeBinder(numaConfig, numaId)
                                         : OptionalThreadToNumaNodeBinder(numaId);
 
             threads.emplace_back(
               std::make_unique<Thread>(sharedState, std::move(manager), threadId, binder));
         }
-
+        
         // With threads created, we can now clear the TTs in parallel
-        // and assign the correct TT pointers to each worker.
         if (requested > 0)
         {
             clear();
@@ -232,6 +233,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
         main_thread()->wait_for_search_finished();
     }
 }
+
 
 // Sets threadPool data to initial values
 void ThreadPool::clear() {
@@ -262,10 +264,12 @@ void ThreadPool::clear() {
     main_manager()->tm.clear();
 }
 
+
 void ThreadPool::run_on_thread(size_t threadId, std::function<void()> f) {
     assert(threads.size() > threadId);
     threads[threadId]->run_custom_job(std::move(f));
 }
+
 
 void ThreadPool::wait_on_thread(size_t threadId) {
     assert(threads.size() > threadId);
@@ -274,8 +278,8 @@ void ThreadPool::wait_on_thread(size_t threadId) {
 
 size_t ThreadPool::num_threads() const { return threads.size(); }
 
+
 // Wakes up main thread waiting in idle_loop() and returns immediately.
-// Main thread will wake up other threads and start the search.
 void ThreadPool::start_thinking(const OptionsMap&  options,
                                 Position&          pos,
                                 StateListPtr&      states,
@@ -284,7 +288,7 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
     main_thread()->wait_for_search_finished();
 
     main_manager()->stopOnPonderhit = stop = abortedSearch = false;
-    main_manager()->ponder                                 = limits.ponderMode;
+    main_manager()->ponder                                = limits.ponderMode;
 
     increaseDepth = true;
 
@@ -293,7 +297,7 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
 
     for (const auto& uciMove : limits.searchmoves)
     {
-        auto move = UCIEngine::to_move(pos, uciMove);
+        auto move = UCIE_Engine::to_move(pos, uciMove);
 
         if (std::find(legalmoves.begin(), legalmoves.end(), move) != legalmoves.end())
             rootMoves.emplace_back(move);
@@ -305,24 +309,19 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
 
     Tablebases::Config tbConfig = Tablebases::rank_root_moves(options, pos, rootMoves);
 
-    // After ownership transfer 'states' becomes empty, so if we stop the search
-    // and call 'go' again without setting a new position states.get() == nullptr.
+    // After ownership transfer 'states' becomes empty...
     assert(states.get() || setupStates.get());
 
     if (states.get())
         setupStates = std::move(states);  // Ownership transfer, states is now empty
 
-    // We use Position::set() to set root position across threads. But there are
-    // some StateInfo fields (previous, pliesFromNull, capturedPiece) that cannot
-    // be deduced from a fen string, so set() clears them and they are set from
-    // setupStates->back() later. The rootState is per thread, earlier states are
-    // shared since they are read-only.
+    // We use Position::set() to set root position across threads...
     for (auto&& th : threads)
     {
         th->run_custom_job([&]() {
             th->worker->limits = limits;
             th->worker->nodes = th->worker->tbHits = th->worker->nmpMinPly =
-              th->worker->bestMoveChanges          = 0;
+              th->worker->bestMoveChanges           = 0;
             th->worker->rootDepth = th->worker->completedDepth = 0;
             th->worker->rootMoves                              = rootMoves;
             th->worker->rootPos.set(pos.fen(), pos.is_chess960(), &th->worker->rootState);
@@ -403,6 +402,7 @@ Thread* ThreadPool::get_best_thread() const {
     return bestThread;
 }
 
+
 // Start non-main threads.
 // Will be invoked by main thread after it has started searching.
 void ThreadPool::start_searching() {
@@ -411,6 +411,7 @@ void ThreadPool::start_searching() {
         if (th != threads.front())
             th->start_searching();
 }
+
 
 // Wait for non-main threads
 void ThreadPool::wait_for_search_finished() const {
