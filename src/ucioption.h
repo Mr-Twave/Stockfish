@@ -1,3 +1,4 @@
+
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
@@ -27,6 +28,7 @@
 #include <string>
 
 namespace Stockfish {
+
 // Define a custom comparator, because the UCI options should be case-insensitive
 struct CaseInsensitiveLess {
     bool operator()(const std::string&, const std::string&) const;
@@ -61,7 +63,6 @@ class Option {
     friend class Engine;
     friend class Tune;
 
-
     std::string       defaultValue, currentValue, type;
     int               min, max;
     size_t            idx;
@@ -89,6 +90,9 @@ class OptionsMap {
 
     std::size_t count(const std::string&) const;
 
+    // Callback for when hash-related options change
+    std::function<void()> on_hash_change;
+
    private:
     friend class Engine;
     friend class Option;
@@ -103,4 +107,5 @@ class OptionsMap {
 };
 
 }
+
 #endif  // #ifndef UCIOPTION_H_INCLUDED
