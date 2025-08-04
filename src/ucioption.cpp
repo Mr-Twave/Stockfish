@@ -1,3 +1,4 @@
+
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
@@ -54,8 +55,13 @@ void OptionsMap::setoption(std::istringstream& is) {
 
     if (options_map.count(name))
         options_map[name] = value;
-    else
+    else if (name != "UCI_Chess960") // Filter out unsupported options from old GUIs
         sync_cout << "No such option: " << name << sync_endl;
+
+    // When any hash size option changes, we need to trigger a resize of the TTs.
+    if (name == "Hash" || name == "HashL1PerNodeMB" || name == "HashL2SharedMB")
+        if (on_hash_change)
+            on_hash_change();
 }
 
 const Option& OptionsMap::operator[](const std::string& name) const {
@@ -81,7 +87,6 @@ void OptionsMap::add(const std::string& name, const Option& option) {
         std::exit(EXIT_FAILURE);
     }
 }
-
 
 std::size_t OptionsMap::count(const std::string& name) const { return options_map.count(name); }
 
@@ -143,7 +148,6 @@ bool Option::operator==(const char* s) const {
 }
 
 bool Option::operator!=(const char* s) const { return !(*this == s); }
-
 
 // Updates currentValue and triggers on_change() action. It's up to
 // the GUI to check for option's limits, but we could receive the new value
@@ -210,4 +214,5 @@ std::ostream& operator<<(std::ostream& os, const OptionsMap& om) {
 
     return os;
 }
+
 }
