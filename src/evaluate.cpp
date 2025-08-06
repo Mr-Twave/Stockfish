@@ -46,6 +46,53 @@ int Eval::simple_eval(const Position& pos) {
          + (pos.non_pawn_material(c) - pos.non_pawn_material(~c));
 }
 
+
+// Add fast evaluation mode support
+Value Eval::evaluate(const LazyNumaReplicated<NNUE::Networks>& networks,
+              const Position& pos,
+              NNUE::AccumulatorStack& accumulatorStack,
+              NNUE::AccumulatorCaches& caches,
+              int optimism,
+              bool useFastNetwork) {
+    
+    // Check for flip_perspective optimization opportunity
+    if (accumulatorStack.needs_refresh()) {
+        // Force refresh if perspective was flipped
+        accumulatorStack.pop();
+        accumulatorStack.push(pos);
+    }
+    
+    const auto& network = networks[0];
+    
+    if (useFastNetwork) {
+        // Use smaller, faster network for non-critical evaluations
+        // This would require having two network architectures loaded
+        // For now, we can use a simplified evaluation path
+        
+        // Fast path: Skip some expensive computations
+        const auto& accumulator = accumulatorStack.top();
+        Value psqt = accumulator.psqtAccumulation[pos.side_to_move()];
+        
+        // Quick material + PSQ evaluation for obviously won/lost positions
+        if (std::abs(psqt) > 1000) {
+            return psqt + optimism;
+        }
+    }
+    
+    // Normal evaluation path
+    const auto [psqt, positional] = network.evaluate(
+        accumulatorStack.top(),
+        pos.side_to_move(),
+        caches);
+    
+    // Optimism bonus
+    Value nnue = psqt + positional;
+    Value adjusted = nnue + optimism;
+    
+    // Ensure evaluation stays within bounds
+    return std::clamp(adjusted, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
+}
+
 bool Eval::use_smallnet(const Position& pos) { return std::abs(simple_eval(pos)) > 962; }
 
 // Evaluate is the evaluator for the outer world. It returns a static evaluation
