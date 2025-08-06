@@ -85,6 +85,44 @@ void AccumulatorStack::pop() noexcept {
     size--;
 }
 
+// Optimized flip_perspective implementation
+void AccumulatorStack::flip_perspective() {
+    if (size == 0)
+        return;
+    
+    auto& current = stack[size - 1];
+    
+    // Instead of full recomputation, swap accumulator perspectives
+    // This is much faster than recomputing from scratch
+    alignas(64) BiasType temp[HalfDimensions];
+    
+    // Use SIMD for efficient swapping
+#ifdef USE_AVX2
+    for (size_t i = 0; i < HalfDimensions; i += 8) {
+        __m256i white_vec = _mm256_load_si256((__m256i*)&current.white[i]);
+        __m256i black_vec = _mm256_load_si256((__m256i*)&current.black[i]);
+        _mm256_store_si256((__m256i*)&current.white[i], black_vec);
+        _mm256_store_si256((__m256i*)&current.black[i], white_vec);
+    }
+#else
+    std::memcpy(temp, current.white, sizeof(BiasType) * HalfDimensions);
+    std::memcpy(current.white, current.black, sizeof(BiasType) * HalfDimensions);
+    std::memcpy(current.black, temp, sizeof(BiasType) * HalfDimensions);
+#endif
+    
+    // Mark as flipped for proper restoration
+    current.perspectiveFlipped = !current.perspectiveFlipped;
+}
+
+// Check if accumulator needs refresh after null move
+bool AccumulatorStack::needs_refresh() const {
+    if (size == 0)
+        return false;
+    
+    const auto& current = stack[size - 1];
+    return current.perspectiveFlipped || current.computationState != COMPUTED;
+}
+
 template<IndexType Dimensions>
 void AccumulatorStack::evaluate(const Position&                       pos,
                                 const FeatureTransformer<Dimensions>& featureTransformer,
