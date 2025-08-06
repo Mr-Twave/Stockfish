@@ -410,9 +410,29 @@ ifeq ($(COMP),gcc)
     # Detect libnuma to enable NUMA-aware TT.
     # The pkg-config check is the most reliable way.
     has_libnuma := $(shell pkg-config --exists libnuma && echo yes)
+
+    # Enable NUMA-aware hierarchical TT if libnuma is available
     ifeq ($(has_libnuma), yes)
         CXXFLAGS += -DUSE_NUMA_TT
         LDFLAGS  += -lnuma
+        
+        # Add optimization flags for NUMA systems
+        CXXFLAGS += -DNUMA_CACHE_LINE_ALIGN
+        
+        # Enable prefetching optimizations
+        CXXFLAGS += -DPREFETCH_TT_ENTRIES
+    endif
+    
+    # Add search optimization flags
+    ifeq ($(optimize), yes)
+        # Enable batched move processing
+        CXXFLAGS += -DBATCHED_MOVE_PROCESSING
+        
+        # Enable adaptive NNUE evaluation
+        CXXFLAGS += -DADAPTIVE_NNUE
+        
+        # Enable policy-based search
+        CXXFLAGS += -DPOLICY_BASED_SEARCH
     endif
 
     ifeq ($(arch),$(filter $(arch),armv7 armv8 riscv64))
