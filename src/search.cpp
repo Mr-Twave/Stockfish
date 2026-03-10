@@ -141,6 +141,11 @@ void update_all_stats(const Position& pos,
                       Depth           depth,
                       Move            ttMove);
 
+int pawn_lmr_confidence(const Position& pos, Search::Worker& workerThread, Move move) {
+    const int ph = workerThread.sharedHistory.pawn_entry(pos)[pos.moved_piece(move)][move.to_sq()];
+    return std::clamp(ph / 4096, -2, 2);
+}
+
 bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
     if (pos.capture_stage(move) || pos.rule50_count() < 11)
         return false;
@@ -1040,6 +1045,7 @@ moves_loop:  // When in check, search starts here
         int delta = beta - alpha;
 
         Depth r = reduction(improving, depth, moveCount, delta);
+        int   pawnConfAdj = 0;
 
         // Increase reduction for ttPv nodes (*Scaler)
         // Larger values scale well
@@ -1113,6 +1119,9 @@ moves_loop:  // When in check, search starts here
                 // Prune moves with negative SEE
                 if (!pos.see_ge(move, -25 * lmrDepth * lmrDepth))
                     continue;
+
+                if (moveCount > 1 && move != ttData.move && depth >= 4 && depth <= 15)
+                    pawnConfAdj = 40 * pawn_lmr_confidence(pos, *this, move);
             }
         }
 
@@ -1222,6 +1231,7 @@ moves_loop:  // When in check, search starts here
 
         // Decrease/increase reduction for moves with a good/bad history
         r -= ss->statScore * 454 / 4096;
+        r -= pawnConfAdj;
 
         // Scale up reductions for expected ALL nodes
         if (allNode)
