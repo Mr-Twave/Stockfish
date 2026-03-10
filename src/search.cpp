@@ -141,6 +141,28 @@ void update_all_stats(const Position& pos,
                       Depth           depth,
                       Move            ttMove);
 
+inline int sign3(int x) { return (x > 0) - (x < 0); }
+
+int quiet_consensus(const Position& pos, Stack* ss, Search::Worker& workerThread, Move move) {
+    const Piece  pc = pos.moved_piece(move);
+    const Square to = move.to_sq();
+
+    int gamma = 0;
+    gamma += sign3((*(ss - 1)->continuationHistory)[pc][to]);
+    gamma += sign3((*(ss - 2)->continuationHistory)[pc][to]);
+    gamma += sign3(workerThread.sharedHistory.pawn_entry(pos)[pc][to]);
+
+    if (ss->ply < LOW_PLY_HISTORY_SIZE)
+        gamma += sign3(workerThread.lowPlyHistory[ss->ply][move.raw()]);
+
+    return std::clamp(gamma, -2, 4);
+}
+
+int pawn_lmr_confidence(const Position& pos, Search::Worker& workerThread, Move move) {
+    const int ph = workerThread.sharedHistory.pawn_entry(pos)[pos.moved_piece(move)][move.to_sq()];
+    return std::clamp(ph / 4096, -2, 2);
+}
+
 bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
     if (pos.capture_stage(move) || pos.rule50_count() < 11)
         return false;
@@ -1040,6 +1062,7 @@ moves_loop:  // When in check, search starts here
         int delta = beta - alpha;
 
         Depth r = reduction(improving, depth, moveCount, delta);
+        int   pawnConfAdj = 0;
 
         // Increase reduction for ttPv nodes (*Scaler)
         // Larger values scale well
@@ -1113,6 +1136,9 @@ moves_loop:  // When in check, search starts here
                 // Prune moves with negative SEE
                 if (!pos.see_ge(move, -25 * lmrDepth * lmrDepth))
                     continue;
+
+                if (moveCount > 1 && move != ttData.move && depth >= 4 && depth <= 15)
+                    pawnConfAdj = 48 * pawn_lmr_confidence(pos, *this, move);
             }
         }
 
@@ -1222,6 +1248,7 @@ moves_loop:  // When in check, search starts here
 
         // Decrease/increase reduction for moves with a good/bad history
         r -= ss->statScore * 454 / 4096;
+        r -= pawnConfAdj;
 
         // Scale up reductions for expected ALL nodes
         if (allNode)
@@ -1835,14 +1862,24 @@ void update_all_stats(const Position& pos,
 
     if (!pos.capture_stage(bestMove))
     {
-        update_quiet_histories(pos, ss, workerThread, bestMove, bonus * 810 / 1024);
+        int bestQuietBonus = bonus * 810 / 1024;
+        int gamma          = quiet_consensus(pos, ss, workerThread, bestMove);
+        if (gamma > 0)
+            bestQuietBonus = bestQuietBonus * (1024 + 12 * gamma) / 1024;
+
+        update_quiet_histories(pos, ss, workerThread, bestMove, bestQuietBonus);
 
         int actualMalus = malus * 1159 / 1024;
-        // Decrease stats for all non-best quiet moves
         for (Move move : quietsSearched)
         {
             actualMalus = actualMalus * 963 / 1024;
-            update_quiet_histories(pos, ss, workerThread, move, -actualMalus);
+
+            gamma    = quiet_consensus(pos, ss, workerThread, move);
+            int damp = 1024;
+            if (gamma > 1)
+                damp -= 24 * (gamma - 1);
+
+            update_quiet_histories(pos, ss, workerThread, move, -actualMalus * damp / 1024);
         }
     }
     else
