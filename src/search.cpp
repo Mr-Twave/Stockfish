@@ -152,15 +152,12 @@ int quiet_consensus(const Position& pos, Stack* ss, Search::Worker& workerThread
     gamma += sign3((*(ss - 2)->continuationHistory)[pc][to]);
     gamma += sign3(workerThread.sharedHistory.pawn_entry(pos)[pc][to]);
 
-    if (ss->ply < LOW_PLY_HISTORY_SIZE)
-        gamma += sign3(workerThread.lowPlyHistory[ss->ply][move.raw()]);
-
-    return std::clamp(gamma, -2, 4);
+    return std::clamp(gamma, -1, 3);
 }
 
 int pawn_lmr_confidence(const Position& pos, Search::Worker& workerThread, Move move) {
     const int ph = workerThread.sharedHistory.pawn_entry(pos)[pos.moved_piece(move)][move.to_sq()];
-    return std::clamp(ph / 4096, -2, 2);
+    return (ph > 4096) - (ph < -4096);
 }
 
 bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
@@ -565,7 +562,6 @@ void Search::Worker::iterative_deepening() {
                              skill.best ? skill.best : skill.pick_best(rootMoves, multiPV)));
 }
 
-
 void Search::Worker::do_move(Position& pos, const Move move, StateInfo& st, Stack* const ss) {
     do_move(pos, move, st, pos.gives_check(move), ss);
 }
@@ -603,7 +599,6 @@ void Search::Worker::undo_move(Position& pos, const Move move) {
 
 void Search::Worker::undo_null_move(Position& pos) { pos.undo_null_move(); }
 
-
 // Reset histories, usually before a new game
 void Search::Worker::clear() {
     mainHistory.fill(0);
@@ -630,7 +625,6 @@ void Search::Worker::clear() {
 
     refreshTable.clear(networks[numaAccessToken]);
 }
-
 
 // Main search function for both PV and non-PV nodes
 template<NodeType nodeType>
@@ -888,7 +882,6 @@ Value Search::Worker::search(
             sharedHistory.pawn_entry(pos)[pos.piece_on(prevSq)][prevSq] << evalDiff * 13;
     }
 
-
     // Step 7. Razoring
     // If eval is really low, skip search entirely and return the qsearch value.
     // For PvNodes, we must have a guard against mates being returned.
@@ -1014,7 +1007,6 @@ moves_loop:  // When in check, search starts here
       (ss - 1)->continuationHistory, (ss - 2)->continuationHistory, (ss - 3)->continuationHistory,
       (ss - 4)->continuationHistory, (ss - 5)->continuationHistory, (ss - 6)->continuationHistory};
 
-
     MovePicker mp(pos, ttData.move, depth, &mainHistory, &lowPlyHistory, &captureHistory, contHist,
                   &sharedHistory, ss->ply);
 
@@ -1137,8 +1129,8 @@ moves_loop:  // When in check, search starts here
                 if (!pos.see_ge(move, -25 * lmrDepth * lmrDepth))
                     continue;
 
-                if (moveCount > 1 && move != ttData.move && depth >= 4 && depth <= 15)
-                    pawnConfAdj = 48 * pawn_lmr_confidence(pos, *this, move);
+                if (moveCount > 2 && move != ttData.move && depth >= 4 && depth <= 15)
+                    pawnConfAdj = 64 * pawn_lmr_confidence(pos, *this, move);
             }
         }
 
@@ -1248,7 +1240,8 @@ moves_loop:  // When in check, search starts here
 
         // Decrease/increase reduction for moves with a good/bad history
         r -= ss->statScore * 454 / 4096;
-        r -= pawnConfAdj;
+        if (!capture && std::abs(ss->statScore) < 8192)
+            r -= pawnConfAdj;
 
         // Scale up reductions for expected ALL nodes
         if (allNode)
@@ -1511,7 +1504,6 @@ moves_loop:  // When in check, search starts here
 
     return bestValue;
 }
-
 
 // Quiescence search function, which is called by the main search function with
 // depth zero, or recursively with further decreasing depth. With depth <= 0, we
@@ -1789,7 +1781,6 @@ namespace {
 // The function is called before storing a value in the transposition table.
 Value value_to_tt(Value v, int ply) { return is_win(v) ? v + ply : is_loss(v) ? v - ply : v; }
 
-
 // Inverse of value_to_tt(): it adjusts a mate or TB score from the transposition
 // table (which refers to the plies to mate/be mated from current position) to
 // "plies to mate/be mated (TB win/loss) from the root". However, to avoid
@@ -1831,7 +1822,6 @@ Value value_from_tt(Value v, int ply, int r50c) {
     return v;
 }
 
-
 // Adds current move and appends child pv[]
 void update_pv(Move* pv, Move move, const Move* childPv) {
 
@@ -1839,7 +1829,6 @@ void update_pv(Move* pv, Move move, const Move* childPv) {
         *pv++ = *childPv++;
     *pv = Move::none();
 }
-
 
 // Updates stats at the end of search() when a bestMove is found
 void update_all_stats(const Position& pos,
@@ -1864,8 +1853,8 @@ void update_all_stats(const Position& pos,
     {
         int bestQuietBonus = bonus * 810 / 1024;
         int gamma          = quiet_consensus(pos, ss, workerThread, bestMove);
-        if (gamma > 0)
-            bestQuietBonus = bestQuietBonus * (1024 + 12 * gamma) / 1024;
+        if (bestMove != ttMove && gamma > 1)
+            bestQuietBonus = bestQuietBonus * (1024 + 10 * (gamma - 1)) / 1024;
 
         update_quiet_histories(pos, ss, workerThread, bestMove, bestQuietBonus);
 
@@ -1876,8 +1865,8 @@ void update_all_stats(const Position& pos,
 
             gamma    = quiet_consensus(pos, ss, workerThread, move);
             int damp = 1024;
-            if (gamma > 1)
-                damp -= 24 * (gamma - 1);
+            if (move != ttMove && gamma > 1)
+                damp -= 16 * (gamma - 1);
 
             update_quiet_histories(pos, ss, workerThread, move, -actualMalus * damp / 1024);
         }
@@ -1902,7 +1891,6 @@ void update_all_stats(const Position& pos,
         captureHistory[movedPiece][move.to_sq()][capturedPiece] << -malus * 1561 / 1024;
     }
 }
-
 
 // Updates histories of the move pairs formed by moves
 // at ply -1, -2, -3, -4, and -6 with current move.
@@ -2249,6 +2237,5 @@ bool RootMove::extract_ponder_from_tt(const TranspositionTable& tt, Position& po
     pos.undo_move(pv[0]);
     return pv.size() > 1;
 }
-
 
 }  // namespace Stockfish
