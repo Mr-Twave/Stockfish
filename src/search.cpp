@@ -421,16 +421,13 @@ void Search::Worker::iterative_deepening() {
             // Sort the PV lines searched so far and update the GUI
             std::stable_sort(rootMoves.begin() + pvFirst, rootMoves.begin() + pvIdx + 1);
 
+            const bool exactStoppedLoss =
+              threads.stop && is_loss(rootMoves[0].uciScore)
+              && rootMoves[0].score == rootMoves[0].uciScore;
+
             if (mainThread
                 && (threads.stop || pvIdx + 1 == multiPV || nodes > 10000000)
-                // A thread that aborted search can have a mated-in/TB-loss score and
-                // PV that cannot be trusted, i.e. it can be delayed or refuted if we
-                // would have had time to fully search other root-moves. Thus here we
-                // suppress any exact mated-in/TB loss output and, if we do, below pick
-                // the score/PV from the previously completed iteration with the most
-                // recent bestmove change.
-                && !(threads.stop && is_loss(rootMoves[0].uciScore)
-                     && rootMoves[0].score == rootMoves[0].uciScore))
+                && !exactStoppedLoss)
                 main_manager()->pv(*this, threads, tt, rootDepth);
 
             if (threads.stop)
@@ -443,7 +440,8 @@ void Search::Worker::iterative_deepening() {
         // We make sure not to pick an unproven mated-in score,
         // in case this thread prematurely stopped search (aborted-search).
         if (completedDepth != rootDepth && rootMoves[0].score != -VALUE_INFINITE
-            && is_loss(rootMoves[0].score))
+            && is_loss(rootMoves[0].score)
+            && rootMoves[0].score == rootMoves[0].uciScore)
         {
             // Bring the last best move to the front for best thread selection.
             Utility::move_to_front(rootMoves, [&lastBestPV = std::as_const(lastBestPV)](
