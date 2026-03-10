@@ -141,6 +141,20 @@ void update_all_stats(const Position& pos,
                       Depth           depth,
                       Move            ttMove);
 
+inline int sign3(int x) { return (x > 0) - (x < 0); }
+
+int quiet_consensus(const Position& pos, Stack* ss, Search::Worker& workerThread, Move move) {
+    const Piece  pc = pos.moved_piece(move);
+    const Square to = move.to_sq();
+
+    int gamma = 0;
+    gamma += sign3((*(ss - 1)->continuationHistory)[pc][to]);
+    gamma += sign3((*(ss - 2)->continuationHistory)[pc][to]);
+    gamma += sign3(workerThread.sharedHistory.pawn_entry(pos)[pc][to]);
+
+    return std::clamp(gamma, -2, 3);
+}
+
 bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
     if (pos.capture_stage(move) || pos.rule50_count() < 11)
         return false;
@@ -1837,12 +1851,18 @@ void update_all_stats(const Position& pos,
     {
         update_quiet_histories(pos, ss, workerThread, bestMove, bonus * 810 / 1024);
 
-        int actualMalus = malus * 1159 / 1024;
+        int actualMalus = malus * 1100 / 1024;
         // Decrease stats for all non-best quiet moves
         for (Move move : quietsSearched)
         {
-            actualMalus = actualMalus * 963 / 1024;
-            update_quiet_histories(pos, ss, workerThread, move, -actualMalus);
+            actualMalus = actualMalus * 950 / 1024;
+
+            int damp = 1024;
+            int gamma = quiet_consensus(pos, ss, workerThread, move);
+            if (gamma > 1)
+                damp -= 20 * (gamma - 1);
+
+            update_quiet_histories(pos, ss, workerThread, move, -actualMalus * damp / 1024);
         }
     }
     else
