@@ -312,9 +312,11 @@ void Search::Worker::iterative_deepening() {
 
     lowPlyHistory.fill(100);
 
+    constexpr int mainHistoryDefault = 68;
     for (Color c : {WHITE, BLACK})
         for (int i = 0; i < UINT_16_HISTORY_SIZE; i++)
-            mainHistory[c][i] = mainHistory[c][i] * 778 / 1024;
+            mainHistory[c][i] = (mainHistory[c][i] - mainHistoryDefault) * 778 / 1024
+                              + mainHistoryDefault;
 
     // Iterative deepening loop until requested to stop or the target depth is reached
     while (++rootDepth < MAX_PLY && !threads.stop
