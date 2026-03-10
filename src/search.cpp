@@ -117,8 +117,12 @@ void update_correction_history(const Position& pos,
     const int    mask   = int(m.is_ok());
     const Square to     = m.to_sq_unchecked();
     const Piece  pc     = pos.piece_on(to);
-    const int    bonus2 = (bonus * 129 / 128) * mask;
-    const int    bonus4 = (bonus * 61 / 128) * mask;
+    int contScale = 1024;
+    if (std::abs(bonus) < CORRECTION_HISTORY_LIMIT / 8)
+        contScale += 10 * continuation_correction_agreement(pos, ss, m, bonus);
+
+    const int    bonus2 = (bonus * 129 / 128) * contScale / 1024 * mask;
+    const int    bonus4 = (bonus * 61 / 128) * contScale / 1024 * mask;
     (*(ss - 2)->continuationCorrectionHistory)[pc][to] << bonus2;
     (*(ss - 4)->continuationCorrectionHistory)[pc][to] << bonus4;
 }
@@ -140,6 +144,22 @@ void update_all_stats(const Position& pos,
                       SearchedList&   capturesSearched,
                       Depth           depth,
                       Move            ttMove);
+
+int continuation_correction_agreement(const Position& pos, Stack* ss, Move m, int bonus) {
+    if (!m.is_ok() || bonus == 0)
+        return 0;
+
+    const Square to = m.to_sq_unchecked();
+    const Piece  pc = pos.piece_on(to);
+
+    const int ch2 = (*(ss - 2)->continuationCorrectionHistory)[pc][to];
+    const int ch4 = (*(ss - 4)->continuationCorrectionHistory)[pc][to];
+
+    int agree = 0;
+    agree += (ch2 != 0) && ((ch2 > 0) == (bonus > 0)) && (std::abs(ch2) > 8);
+    agree += (ch4 != 0) && ((ch4 > 0) == (bonus > 0)) && (std::abs(ch4) > 8);
+    return agree;
+}
 
 bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
     if (pos.capture_stage(move) || pos.rule50_count() < 11)
